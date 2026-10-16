@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+# Launcher biar bisa dipanggil: python scrape   /   ./scrape   /   scrape
+# Isinya cuma nerusin ke scrape.py di folder yang sama.
+import os
+import runpy
+import sys
+
+_here = os.path.dirname(os.path.abspath(__file__))
+_target = os.path.join(_here, "scrape.py")
+if not os.path.exists(_target):
+    sys.exit(f"scrape.py gak ketemu di {_here}")
+if _here not in sys.path:
+    sys.path.insert(0, _here)
+sys.argv[0] = _target
+runpy.run_path(_target, run_name="__main__")

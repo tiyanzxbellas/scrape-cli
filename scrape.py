@@ -501,28 +501,15 @@ NOISE = ("fonts.g", "cdn.jsdelivr", "unpkg.com", "googleapis.com/css", "gstatic"
          "sentry.io", "googletagmanager", "google-analytics", "cloudflareinsights")
 
 
-def discover(url: str, sesi: requests.Session, args):
-    """Lacak endpoint API dari sebuah halaman: HTML -> file JS -> URL/tabel API."""
-    print(f"\n=== DISCOVER: {url} ===")
-    r = sesi.get(url, headers={"User-Agent": args.user_agent}, timeout=args.timeout,
-                 verify=not args.insecure)
-    print(f"HTTP {r.status_code} | {r.headers.get('Content-Type','-')} | {len(r.text):,} byte")
-    if not (200 <= r.status_code < 300):
-        print("Gagal ambil halaman. Cek URL / butuh login / diblokir.")
-        return 1
-
-    teks = r.text
-    is_json = False
-    try:
-        json.loads(teks)
-        is_json = True
-    except Exception:
-        pass
-
-    if is_json:
-        print("\nHalaman ini langsung balas JSON — gak perlu discover.")
-        print(f"Langsung scrape:\n  python scrape.py {url} -o hasil.csv")
-        return 0
+def analisis_situs(url: str, teks: str, sesi: requests.Session, args, cetak=None):
+    """
+    Bedah sebuah halaman: struktur HTML + semua bundle JS.
+    Kembalikan dict temuan (endpoint, tabel, URL eksternal, sinyal SPA).
+    `cetak` = fungsi log (None = senyap).
+    """
+    def katakan(*a):
+        if cetak:
+            cetak(*a)
 
     try:
         from bs4 import BeautifulSoup
@@ -532,7 +519,6 @@ def discover(url: str, sesi: requests.Session, args):
             soup = BeautifulSoup(teks, "html.parser")
     except ImportError:
         soup = None
-
     # --- sinyal SPA ---
     n_a = len(soup.find_all("a", href=True)) if soup else 0
     n_script = len(soup.find_all("script")) if soup else 0
@@ -540,23 +526,23 @@ def discover(url: str, sesi: requests.Session, args):
     teks_body = soup.get_text(" ", strip=True) if soup else ""
     spa = bool(root) and n_a == 0 and len(teks_body) < 300
 
-    print(f"\n[struktur] <a>={n_a}  <script>={n_script}  teks terlihat={len(teks_body)} karakter")
+    katakan(f"\n[struktur] <a>={n_a}  <script>={n_script}  teks terlihat={len(teks_body)} karakter")
     if spa:
-        print("★ Ini SPA (React/Vue/Next) — HTML-nya kerangka kosong, data diambil dari API.")
-        print("  Scraping HTML gak akan dapat apa-apa. Harus nemu endpoint API-nya (di bawah).")
+        katakan("★ Ini SPA (React/Vue/Next) — HTML-nya kerangka kosong, data diambil dari API.")
+        katakan("  Scraping HTML gak akan dapat apa-apa. Harus nemu endpoint API-nya (di bawah).")
     elif n_a >= 3:
-        print("→ Halaman HTML biasa, scraping langsung bisa jalan.")
+        katakan("→ Halaman HTML biasa, scraping langsung bisa jalan.")
 
     # --- link di HTML ---
     if soup and n_a:
-        print(f"\n[link di HTML] ({n_a} total, maks 25 ditampilkan)")
+        katakan(f"\n[link di HTML] ({n_a} total, maks 25 ditampilkan)")
         seen = set()
         for a in soup.find_all("a", href=True):
             u = urljoin(url, a["href"])
             if u in seen or u.startswith(("javascript:", "#", "mailto:")):
                 continue
             seen.add(u)
-            print(f"  {u[:95]:95s} | {a.get_text(' ', strip=True)[:35]}")
+            katakan(f"  {u[:95]:95s} | {a.get_text(' ', strip=True)[:35]}")
             if len(seen) >= 25:
                 break
 
@@ -572,7 +558,7 @@ def discover(url: str, sesi: requests.Session, args):
 
     bundle = ""
     if js_files:
-        print(f"\n[js] mengunduh {len(js_files)} file bundle...")
+        katakan(f"\n[js] mengunduh {len(js_files)} file bundle...")
         diunduh = set()
 
         def ambil(daftar):
@@ -595,9 +581,9 @@ def discover(url: str, sesi: requests.Session, args):
                   for m in JS_URL_RE.findall(bundle)]
         baru = [e for e in dict.fromkeys(ekstra) if e not in diunduh]
         if baru:
-            print(f"[js] +{min(len(baru), args.max_js - len(diunduh))} chunk lazy-load...")
+            katakan(f"[js] +{min(len(baru), args.max_js - len(diunduh))} chunk lazy-load...")
             ambil(baru)
-        print(f"     terkumpul {len(bundle):,} byte JavaScript dari {len(diunduh)} file")
+        katakan(f"     terkumpul {len(bundle):,} byte JavaScript dari {len(diunduh)} file")
 
     sumber = teks + "\n" + bundle
     temuan = {}
@@ -629,39 +615,219 @@ def discover(url: str, sesi: requests.Session, args):
     for m in RPC_RE.findall(sumber):
         catat("Fungsi RPC", m)
 
+    hasil = {
+        "url": url, "soup": soup, "spa": spa, "n_link": n_a,
+        "teks_body": teks_body, "temuan": temuan, "js_bytes": len(bundle),
+    }
     if not temuan:
-        print("\nGak ketemu endpoint API di HTML/JS. Kemungkinan:")
-        print("  - URL API dibentuk dinamis (template string) -> butuh DevTools tab Network")
-        print("  - atau datanya memang server-rendered")
-        return 0
+        katakan("\nGak ketemu endpoint API di HTML/JS. Kemungkinan:")
+        katakan("  - URL API dibentuk dinamis (template string) -> butuh DevTools tab Network")
+        katakan("  - atau datanya memang server-rendered")
+        return hasil
 
     for kat in ("Supabase", "Firebase", "Path API", "URL eksternal", "Tabel Supabase", "Fungsi RPC"):
         if kat not in temuan:
             continue
-        print(f"\n[{kat}]")
+        katakan(f"\n[{kat}]")
         for nilai, cat in list(temuan[kat].items())[:30]:
-            print(f"  {nilai[:100]}" + (f"   ({cat})" if cat else ""))
+            katakan(f"  {nilai[:100]}" + (f"   ({cat})" if cat else ""))
 
     # --- saran perintah siap pakai ---
-    print("\n" + "=" * 62)
-    print("SARAN PERINTAH")
-    print("=" * 62)
+    katakan("\n" + "=" * 62)
+    katakan("SARAN PERINTAH")
+    katakan("=" * 62)
     if "Tabel Supabase" in temuan and "Supabase" in temuan:
         base = next(iter(temuan["Supabase"]))
         for tb in list(temuan["Tabel Supabase"])[:3]:
-            print(f"\n# Supabase/PostgREST — tabel '{tb}'")
-            print(f"python scrape.py -b {base}/rest/v1 -e /{tb} \\")
-            print(f"    -H 'apikey: ANON_KEY' -H 'Authorization: Bearer ANON_KEY' \\")
-            print(f"    --param select=* -o {tb}.csv")
+            katakan(f"\n# Supabase/PostgREST — tabel '{tb}'")
+            katakan(f"python scrape.py -b {base}/rest/v1 -e /{tb} \\")
+            katakan(f"    -H 'apikey: ANON_KEY' -H 'Authorization: Bearer ANON_KEY' \\")
+            katakan(f"    --param select=* -o {tb}.csv")
     if "Path API" in temuan:
         pr = urlparse(url)
         for pa in list(temuan["Path API"])[:3]:
-            print(f"\npython scrape.py -b {pr.scheme}://{pr.netloc} -e {pa} --inspect")
+            katakan(f"\npython scrape.py -b {pr.scheme}://{pr.netloc} -e {pa} --inspect")
     if "URL eksternal" in temuan:
         for ue in list(temuan["URL eksternal"])[:3]:
-            print(f"\npython scrape.py {ue} --inspect")
-    print("\nTip: selalu akhiri dengan --inspect buat lihat struktur datanya sebelum scrape.")
+            katakan(f"\npython scrape.py {ue} --inspect")
+    katakan("\nTip: selalu akhiri dengan --inspect buat lihat struktur datanya sebelum scrape.")
+    return hasil
+
+
+def discover(url: str, sesi: requests.Session, args):
+    """Mode --discover: lacak endpoint API dari sebuah halaman."""
+    print(f"\n=== DISCOVER: {url} ===")
+    try:
+        r = sesi.get(url, headers={"User-Agent": args.user_agent}, timeout=args.timeout,
+                     verify=not args.insecure)
+    except requests.RequestException as e:
+        print(f"Gagal menghubungi {url}: {e}")
+        return 1
+    print(f"HTTP {r.status_code} | {r.headers.get('Content-Type','-')} | {len(r.text):,} byte")
+    if not (200 <= r.status_code < 300):
+        print("Gagal ambil halaman. Cek URL / butuh login / diblokir.")
+        return 1
+    try:
+        json.loads(r.text)
+        print("\nHalaman ini langsung balas JSON — gak perlu discover.")
+        print(f"Langsung scrape:\n  python scrape {url} -o hasil.csv")
+        return 0
+    except Exception:
+        pass
+    analisis_situs(url, r.text, sesi, args, cetak=print)
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# MODE OTOMATIS PENUH — user cuma kasih URL, tool yang mikir
+# --------------------------------------------------------------------------- #
+
+def uji_kandidat(u: str, sesi: requests.Session, args):
+    """Coba satu URL: kalau balas JSON berisi list objek, kembalikan info + skornya."""
+    try:
+        r = sesi.get(u, headers={"User-Agent": args.user_agent}, timeout=args.timeout,
+                     verify=not args.insecure)
+    except requests.RequestException:
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        payload = json.loads(r.text)
+    except Exception:
+        return None
+    path, n = auto_items_path(payload)
+    if n < 2:
+        return None
+    return {"url": u, "items": path, "n": n, "payload": payload,
+            "text": r.text, "status": r.status_code}
+
+
+def kandidat_api(info: dict, url_halaman: str) -> list:
+    """Susun daftar URL API yang layak dicoba dari hasil analisis."""
+    asal = urlparse(url_halaman)
+    base_asal = f"{asal.scheme}://{asal.netloc}"
+    temuan = info.get("temuan", {})
+    out = []
+
+    def tambah(u, prioritas):
+        u = u.strip().rstrip("/")
+        if u and u not in [x[1] for x in out]:
+            out.append((prioritas, u))
+
+    # 1) path API di origin yang sama  -> paling mungkin benar
+    for pa in temuan.get("Path API", {}):
+        tambah(urljoin(base_asal + "/", pa.lstrip("/")), 0)
+    # 2) host API eksternal yang ketemu di bundle
+    for ue in temuan.get("URL eksternal", {}):
+        if any(x in ue for x in (".js", ".css", ".png", ".jpg", ".svg", ".woff", "localhost")):
+            continue
+        tambah(ue, 1)
+        for pa in temuan.get("Path API", {}):
+            tambah(urljoin(ue.rstrip("/") + "/", pa.lstrip("/")), 2)
+    # 3) Supabase REST
+    for sb in temuan.get("Supabase", {}):
+        for tb in temuan.get("Tabel Supabase", {}):
+            tambah(f"{sb.rstrip('/')}/rest/v1/{tb}", 3)
+
+    out.sort(key=lambda x: x[0])
+    return [u for _, u in out]
+
+
+def nama_file_otomatis(url: str) -> str:
+    pr = urlparse(url)
+    host = pr.netloc.replace(":", "_")
+    jalur = "_".join([x for x in pr.path.split("/") if x][-2:]) or "index"
+    nama = f"{host}_{jalur}".replace("..", ".")
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", nama)[:70] + ".csv"
+
+
+def pipeline_otomatis(url: str, sesi: requests.Session, args):
+    """
+    Ambil URL, putuskan sendiri cara scrape-nya:
+      1. JSON langsung?          -> ekstrak
+      2. HTML ada isinya?        -> ekstrak
+      3. HTML kerangka (SPA)?    -> bedah bundle JS, cari endpoint API, uji satu-satu,
+                                    pakai yang paling banyak datanya
+    Kembalikan list[dict] record + info sumber.
+    """
+    print(f"→ {url}")
+    try:
+        r = sesi.get(url, headers={"User-Agent": args.user_agent}, timeout=args.timeout,
+                     verify=not args.insecure)
+    except requests.RequestException as e:
+        print(f"✗ gak bisa hubungi: {e}")
+        return [], None
+    print(f"  HTTP {r.status_code} | {len(r.text):,} byte | {r.headers.get('Content-Type','-')}")
+    if not (200 <= r.status_code < 300):
+        print("✗ respons bukan 2xx.")
+        return [], None
+    r.encoding = args.encoding or r.apparent_encoding or "utf-8"
+
+    # --- 1) JSON ---
+    try:
+        payload = json.loads(r.text)
+        ap_, n_ = auto_items_path(payload)
+        args.items = ap_
+        rows = extract_json(payload, args)
+        print(f"  ✓ JSON — pakai items '{ap_ or '(root)'}' → {len(rows)} record")
+        return rows, {"url": r.url, "items": ap_}
+    except Exception:
+        pass
+
+    # --- 2) HTML ---
+    try:
+        from bs4 import BeautifulSoup
+        try:
+            soup = BeautifulSoup(r.text, "lxml")
+        except Exception:
+            soup = BeautifulSoup(r.text, "html.parser")
+    except ImportError:
+        print("✗ butuh bs4:  pip install beautifulsoup4 lxml")
+        return [], None
+
+    sel, n_ = auto_item_selector(soup)
+    if sel:
+        args.item = sel
+        fs = auto_html_fields(soup, sel)
+        args.field = [f"{f.name}={f.loc}@{f.attr}" for f in fs]
+        rows = extract_html(soup, r.url, args)
+        rows = [x for x in rows if any(str(v).strip() for v in x.values())]
+        if rows:
+            print(f"  ✓ HTML — pakai item '{sel}' ({n_} elemen) → {len(rows)} record")
+            return rows, {"url": r.url, "item": sel}
+
+    # --- 3) SPA: bedah bundle, cari API ---
+    print("  ⚠ HTML-nya kerangka kosong (SPA) — datanya diambil lewat API.")
+    print("  → membedah bundle JavaScript buat cari endpoint...")
+    info = analisis_situs(r.url, r.text, sesi, args, cetak=None)
+    print(f"    {info['js_bytes']:,} byte JS dianalisis")
+    daftar = kandidat_api(info, r.url)
+    if not daftar:
+        print("  ✗ gak ketemu kandidat endpoint API di bundle-nya.")
+        return [], info
+
+    print(f"  → {len(daftar[:args.coba])} kandidat endpoint, diuji satu-satu:")
+    terbaik = None
+    for u in daftar[: args.coba]:
+        hasil = uji_kandidat(u, sesi, args)
+        if hasil:
+            print(f"    ✓ {hasil['n']:>4} record  {u[:78]}")
+            if terbaik is None or hasil["n"] > terbaik["n"]:
+                terbaik = hasil
+        else:
+            print(f"    · lewat        {u[:78]}")
+        time.sleep(0.2)
+
+    if not terbaik:
+        print("  ✗ gak ada endpoint yang balikin data list.")
+        return [], info
+
+    print(f"  ★ pilih: {terbaik['url']}")
+    args.items = terbaik["items"]
+    args.field = []
+    rows = extract_json(terbaik["payload"], args)
+    print(f"  ✓ {len(rows)} record (items '{terbaik['items']}')")
+    return rows, {"url": terbaik["url"], "items": terbaik["items"]}
 
 
 def inspect(resp: dict, args):
@@ -930,6 +1096,8 @@ CONTOH
     g4.add_argument("--discover", action="store_true",
                     help="lacak endpoint API otomatis: scan HTML + semua file JS, "
                          "cari URL API, tabel Supabase/Firebase, path /api/, graphql")
+    g4.add_argument("--coba", type=int, default=12,
+                    help="mode otomatis: jumlah kandidat endpoint yang diuji (default 12)")
     g4.add_argument("--max-js", type=int, default=25, help="--discover: maks file JS yang diunduh (default 25)")
     g4.add_argument("-i", "--inspect", action="store_true",
                     help="mode inspeksi: tampilkan struktur respons + saran --items/--field, lalu keluar")
@@ -993,8 +1161,24 @@ def main(argv=None) -> int:
             args.endpoint.append(t)
 
     if not args.endpoint:
-        sys.exit("Butuh target. Contoh:  python scrape.py https://situs.com\n"
-                 "          atau:  python scrape.py -b https://api.situs.com -e /v1/items")
+        if sys.stdin.isatty() and not (args.inspect or args.discover or args.dry_run):
+            try:
+                jawab = input("URL yang mau di-scrape: ").strip().strip("'\"")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                sys.exit(1)
+            if not jawab:
+                sys.exit("Gak ada URL yang dikasih. Keluar.")
+            if not jawab.startswith("http"):
+                jawab = "https://" + jawab
+            pr = urlparse(jawab)
+            args.base_url = f"{pr.scheme}://{pr.netloc}"
+            args.endpoint.append((pr.path or "/") + (("?" + pr.query) if pr.query else ""))
+            args._interaktif = True
+        else:
+            sys.exit("Butuh target. Contoh:  python scrape https://situs.com\n"
+                     "          atau:  python scrape -b https://api.situs.com -e /v1/items\n"
+                     "          atau jalankan tanpa argumen buat mode tanya-jawab.")
     if args.inspect and not args.base_url:
         sys.exit("--inspect butuh --base-url")
 
@@ -1024,6 +1208,56 @@ def main(argv=None) -> int:
             args.format = "raw"
 
     sesi = build_session(args)
+
+    # --- MODE OTOMATIS PENUH ---
+    # user cuma kasih URL, gak ngasih --items/--field/--item sama sekali
+    mode_auto = not (args.field or args.items or args.item or args.raw_response
+                     or args.inspect or args.discover or args.dry_run
+                     or args.next or args.next_param or args.pages > 1)
+    if mode_auto:
+        sesi_a = build_session(args)
+        if args.login_endpoint:
+            lurl = join_url(args.base_url, args.login_endpoint)
+            log(f"login -> {lurl}")
+            if fetch(lurl, sesi_a, args, method="POST", data=args.login_data,
+                     json_body=args.login_json_parsed, percobaan=2) is None:
+                log("login gagal — lanjut tanpa sesi.")
+        semua = []
+        sumber = None
+        for ep in args.endpoint:
+            full = join_url(args.base_url, ep)
+            rows, info = pipeline_otomatis(full, sesi_a, args)
+            if rows:
+                for row in rows:
+                    if args.meta and info:
+                        row["_url"] = info.get("url", full)
+                semua += rows
+                sumber = info or sumber
+            args.items, args.field, args.item = "", [], None   # reset antar target
+        if args.save_cookies and args.cookies:
+            save_cookies(sesi_a, args.cookies)
+        if not semua:
+            print("\n✗ Gak dapat data. Coba jalankan dengan --discover buat lihat detailnya.",
+                  file=sys.stderr)
+            return 1
+        # nama file otomatis kalau user gak minta -o
+        tujuan = args.out
+        if tujuan == "-":
+            tujuan = nama_file_otomatis((sumber or {}).get("url", join_url(args.base_url, args.endpoint[0])))
+        kolom = []
+        for row in semua:
+            for k in row:
+                if k not in kolom:
+                    kolom.append(k)
+        with open(tujuan, "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=kolom, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(semua)
+        print(f"\n✔ {len(semua)} record × {len(kolom)} kolom  →  {tujuan}")
+        if sumber and sumber.get("url"):
+            print(f"  sumber data : {sumber['url']}")
+        print(f"  mau atur manual? tambahkan --items/--field, atau lihat struktur: --inspect")
+        return 0
 
     # --- discover: lacak endpoint API ---
     if args.discover:

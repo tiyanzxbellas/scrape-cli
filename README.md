@@ -11,12 +11,56 @@ python scrape.py -b https://api.target.com -e /v1/produk \
     -o hasil.csv
 ```
 
-## Cara paling gampang: kasih link aja
+## Paling simpel: `python scrape`
+
+```bash
+python scrape                          # ditanya URL-nya, sisanya otomatis
+python scrape https://situs.com        # langsung jalan, nama file CSV dibuat sendiri
+```
+
+Tidak perlu mikir base-url, endpoint, selector, atau format. Tool-nya memutuskan sendiri:
+
+```
+$ python scrape https://nefusoft2.tiyan.my.id
+→ https://nefusoft2.tiyan.my.id/
+  HTTP 200 | 4.736 byte | text/html; charset=utf-8
+  ⚠ HTML-nya kerangka kosong (SPA) — datanya diambil lewat API.
+  → membedah bundle JavaScript buat cari endpoint...
+    704.776 byte JS dianalisis
+  → 12 kandidat endpoint, diuji satu-satu:
+    ✓   22 record  /api/v1/schedule
+    ✓  116 record  /api/v1/ongoing
+    ✓   60 record  /api/v1/popular
+    · lewat        /api/broadcast
+  ★ pilih: https://nefusoft2.tiyan.my.id/api/v1/ongoing
+  ✓ 116 record (items 'data')
+
+✔ 116 record × 16 kolom  →  nefusoft2.tiyan.my.id_v1_ongoing.csv
+```
+
+**Logika yang dia jalankan sendiri:**
+1. Ambil URL-nya → cek Content-Type
+2. **JSON?** → cari list-of-dict terbesar → jadiin baris CSV
+3. **HTML ada isinya?** → cari elemen berulang pakai heuristik keseragaman → bikin kolom dari anaknya
+4. **HTML kerangka kosong (SPA)?** → unduh semua bundle JS (termasuk chunk lazy-load) →
+   grep endpoint API → **uji tiap kandidat** → pakai yang datanya paling banyak → simpan CSV
+5. Gagal semua? → suruh jalankan `--discover` buat lihat detail
+
+Nama file output dibuat otomatis dari domain + path. Mau tentukan sendiri: `-o nama.csv`.
+
+> `scrape` (tanpa `.py`) adalah launcher ke `scrape.py`. Dua-duanya sama.
+> Mau lebih pendek lagi? Di Termux:
+> ```bash
+> cp scrape $PREFIX/bin/scrape && chmod +x $PREFIX/bin/scrape
+> scrape https://situs.com          # dari folder mana pun
+> ```
+
+## Kalau mau atur sendiri
 
 ```bash
 python scrape.py https://situs.com/api/produk -o hasil.csv
 ```
-Selesai. Tool-nya otomatis:
+Tool-nya otomatis:
 - misahin **base-url** dan **endpoint** dari link itu
 - nebak mode **JSON / HTML** dari Content-Type
 - kalau JSON: nyari list terbesar di respons, jadiin itu baris-baris CSV
@@ -61,7 +105,9 @@ Urutan yang benar: **`--discover` → `--inspect` → scrape**.
 **Fitur**
 - Target **JSON** (dot-path: `data.items[*].price`) dan **HTML** (CSS selector: `h3 a@title`)
 - **Pagination**: ikut URL `next` dari respons, naikkan nomor halaman otomatis, atau cursor
-- **Cukup kasih link**: `python scrape.py https://situs.com` — base-url, endpoint, mode, dan kolom ditebak otomatis
+- **Mode otomatis penuh**: `python scrape https://situs.com` — dia bedah sendiri, termasuk
+  nyari endpoint API kalau situsnya SPA, lalu uji kandidatnya satu-satu
+- **Cukup kasih link**: base-url, endpoint, mode, dan kolom ditebak otomatis
 - **`--discover`**: lacak endpoint API situs SPA dengan membedah bundle JavaScript-nya
 - **Inspeksi otomatis**: `--inspect` nyetak struktur respons + saran `--items`/`--field`/`--next`
 - **Dry-run**: `--dry-run` cetak semua URL yang bakal di-request tanpa ngirim apa-apa
