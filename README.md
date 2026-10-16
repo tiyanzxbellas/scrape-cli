@@ -11,9 +11,58 @@ python scrape.py -b https://api.target.com -e /v1/produk \
     -o hasil.csv
 ```
 
+## Cara paling gampang: kasih link aja
+
+```bash
+python scrape.py https://situs.com/api/produk -o hasil.csv
+```
+Selesai. Tool-nya otomatis:
+- misahin **base-url** dan **endpoint** dari link itu
+- nebak mode **JSON / HTML** dari Content-Type
+- kalau JSON: nyari list terbesar di respons, jadiin itu baris-baris CSV
+- kalau HTML: nyari elemen berulang (kartu/baris tabel) pakai heuristik keseragaman,
+  terus bikin kolom dari anak-anaknya
+
+```bash
+$ python scrape.py https://quotes.toscrape.com -o kutipan.csv
+  auto: pakai --item 'div.quote' (10 elemen), 6 kolom: a_tag, span_text, ...
+✔ 1 request | 1 halaman | 10 record -> kutipan.csv
+```
+
+### Kalau hasilnya kosong → situsnya SPA
+
+Situs React/Vue/Next mengirim HTML kerangka kosong (`<div id="root">`), datanya diambil
+lewat API di sisi klien. Pakai **`--discover`** buat melacak endpoint-nya otomatis:
+
+```bash
+python scrape.py https://situs-spa.com --discover
+```
+Dia akan: deteksi bahwa ini SPA → unduh semua bundle JS (termasuk chunk lazy-load) →
+grep URL API, path `/api/`·`/v1/`·`/graphql`, project Supabase/Firebase, nama tabel
+(`.from('...')`), dan fungsi RPC → lalu **nyetak perintah siap pakai**.
+
+```
+★ Ini SPA (React/Vue/Next) — HTML-nya kerangka kosong, data diambil dari API.
+[js] mengunduh 3 file bundle...
+[js] +27 chunk lazy-load...
+     terkumpul 728.461 byte JavaScript dari 30 file
+
+[Path API]
+  /api/v1/popular
+  /api/v1/schedule
+  /api/v1/genre
+
+SARAN PERINTAH
+python scrape.py -b https://situs-spa.com -e /api/v1/popular --inspect
+```
+
+Urutan yang benar: **`--discover` → `--inspect` → scrape**.
+
 **Fitur**
 - Target **JSON** (dot-path: `data.items[*].price`) dan **HTML** (CSS selector: `h3 a@title`)
 - **Pagination**: ikut URL `next` dari respons, naikkan nomor halaman otomatis, atau cursor
+- **Cukup kasih link**: `python scrape.py https://situs.com` — base-url, endpoint, mode, dan kolom ditebak otomatis
+- **`--discover`**: lacak endpoint API situs SPA dengan membedah bundle JavaScript-nya
 - **Inspeksi otomatis**: `--inspect` nyetak struktur respons + saran `--items`/`--field`/`--next`
 - **Dry-run**: `--dry-run` cetak semua URL yang bakal di-request tanpa ngirim apa-apa
 - **Login/sesi**: POST login, simpan-muat cookie, Basic auth, Bearer token, proxy

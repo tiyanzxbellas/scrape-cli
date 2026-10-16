@@ -206,7 +206,7 @@ def extract_html(soup, page_url: str, args) -> list[dict]:
 
     fields = [Field.parse(f) for f in args.field] if args.field else []
     if not fields:
-        sys.exit("Mode HTML wajib punya minimal satu --field. Contoh: --field 'judul=h2 a@text'")
+        return []
 
     # field pertama dianggap "scope" kalau --item diisi; kalau tidak, tiap field ambil semua match
     scope = soup.select(args.item) if args.item else [soup]
@@ -269,6 +269,121 @@ def find_next(payload_or_soup, page_url: str, args) -> str | None:
 # --------------------------------------------------------------------------- #
 # fetch
 # --------------------------------------------------------------------------- #
+
+SKIP_TAG = {"html", "body", "head", "script", "style", "link", "meta", "title",
+            "noscript", "svg", "path", "br", "hr"}
+
+
+def auto_items_path(payload):
+    """JSON: cari list-of-dict terbesar, kembalikan dot-path-nya."""
+    best = {"path": "", "n": -1}
+
+    def walk(node, path):
+        if isinstance(node, list):
+            if node and all(isinstance(x, dict) for x in node) and len(node) > best["n"]:
+                best["path"], best["n"] = path, len(node)
+            for i, v in enumerate(node):
+                walk(v, f"{path}.{i}" if path else str(i))
+        elif isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, f"{path}.{k}" if path else str(k))
+
+    walk(payload, "")
+    return best["path"], best["n"]
+
+
+def auto_item_selector(soup):
+    """
+    HTML: tebak selector item berulang (kartu/baris tabel).
+
+    Prinsipnya: item asli itu SERAGAM satu sama lain (jumlah anak & panjang teks mirip),
+    sedangkan elemen pembungkus (div.container, div.row) isinya campur aduk dan gede.
+    """
+    import math
+
+    groups = {}
+    for el in soup.find_all(True):
+        if el.name in SKIP_TAG:
+            continue
+        cls = el.get("class")
+        if not cls:
+            continue
+        key = f"{el.name}.{'.'.join(cls[:3])}"
+        groups.setdefault(key, []).append(el)
+
+    def nilai_untuk(min_count):
+        kandidat = []
+        for key, el_list in groups.items():
+            if len(el_list) < min_count:
+                continue
+            sampel = el_list[:12]
+            n = len(sampel)
+            teks = [len(e.get_text(" ", strip=True)) for e in sampel]
+            dalam = [len(e.find_all(True)) for e in sampel]
+            t_avg = sum(teks) / n
+            d_avg = sum(dalam) / n
+
+            # keseragaman: item dalam list mirip satu sama lain
+            if n >= 3 and d_avg > 0:
+                var = sum((x - d_avg) ** 2 for x in dalam) / n
+                rasio = math.sqrt(var) / d_avg
+                seragam = 1.0 if rasio <= 0.6 else max(0.15, 0.6 / rasio)
+            else:
+                seragam = 0.7
+
+            kaya = (1 + min(t_avg, 400) / 80) * (1 + min(d_avg, 30) / 6)
+            # elemen pembungkus biasanya punya >60 keturunan -> dihukum
+            if d_avg > 60:
+                kaya *= 60 / d_avg
+            punya_link = sum(1 for e in sampel if e.find("a") or e.name == "a") / n
+            skor = math.log(len(el_list) + 1) * kaya * seragam * (1 + punya_link)
+            kandidat.append((skor, key, len(el_list)))
+        return kandidat
+
+    for ambang in (3, 2):
+        skor = nilai_untuk(ambang)
+        if skor:
+            skor.sort(reverse=True)
+            return skor[0][1], skor[0][2]
+    return None, 0
+
+
+def auto_html_fields(soup, selector, maksimum=10):
+    """Tebak kolom dari anak elemen yang konsisten muncul di tiap item."""
+    items = soup.select(selector)
+    if not items:
+        return []
+    hitung = {}
+    contoh = {}
+    for it in items:
+        for el in it.find_all(True):
+            if el.name in SKIP_TAG:
+                continue
+            cls = el.get("class")
+            key = f"{el.name}.{'.'.join(cls[:2])}" if cls else el.name
+            hitung[key] = hitung.get(key, 0) + 1
+            if key not in contoh:
+                contoh[key] = el
+    ambang = max(2, len(items) * 0.5)
+    kandidat = [k for k, n in hitung.items() if n >= ambang]
+    kandidat.sort(key=lambda k: -hitung[k])
+
+    fields = []
+    for k in kandidat[:maksimum]:
+        nama = re.sub(r"[^a-z0-9]+", "_", k.lower()).strip("_")
+        attr = "href" if contoh[k].name == "a" else ("src" if contoh[k].name == "img" else "text")
+        fields.append(Field(name=nama, loc=k, attr=attr))
+    if not fields:
+        # item-nya elemen daun (gak punya anak ber-class) -> ambil teks + href/src dirinya
+        pertama = items[0]
+        if pertama.name == "a":
+            fields = [Field(name="teks", loc="", attr="text"), Field(name="link", loc="", attr="href")]
+        elif pertama.name == "img":
+            fields = [Field(name="alt", loc="", attr="alt"), Field(name="src", loc="", attr="src")]
+        else:
+            fields = [Field(name="teks", loc="", attr="text")]
+    return fields
+
 
 def join_url(base: str | None, ep: str) -> str:
     """Gabung base-url + endpoint. Endpoint boleh URL absolut."""
@@ -370,6 +485,184 @@ def log(msg: str):
 # --------------------------------------------------------------------------- #
 # mode inspeksi — buat nemu path/selector tanpa buka laptop
 # --------------------------------------------------------------------------- #
+
+JS_URL_RE = re.compile(r"""["'`](assets/[A-Za-z0-9._@/-]+?\.js|[A-Za-z0-9._@/-]*?\.js)["'`]""")
+ABS_URL_RE = re.compile(r"https?://[A-Za-z0-9._~:/?#@!$&*+,;=%-]{6,120}")
+API_PATH_RE = re.compile(r"""["'`](/(?:api|v\d|rest|graphql|ajax|wp-json)/[A-Za-z0-9._/{},:$-]{1,80})["'`]""")
+SUPA_TABLE_RE = re.compile(r'\.from\(\s*[\x22\x27\x60]([a-z_][a-z0-9_]{1,40})[\x22\x27\x60]\s*\)')
+RPC_RE = re.compile(r'\.rpc\(\s*[\x22\x27\x60]([a-zA-Z_][a-zA-Z0-9_]{1,50})[\x22\x27\x60]')
+SUPA_URL_RE = re.compile(r"https://([a-z0-9]{10,30})\.supabase\.co")
+FIREBASE_RE = re.compile(r"https://([a-z0-9-]+)\.firebaseio\.com|([a-z0-9-]+)\.firebaseapp\.com")
+
+# URL yang jelas bukan API (aset/CDN/sosial) -> disaring dari hasil
+NOISE = ("fonts.g", "cdn.jsdelivr", "unpkg.com", "googleapis.com/css", "gstatic",
+         "facebook.com/sharer", "twitter.com/intent", "t.me/share", "wa.me",
+         "api.whatsapp", "wsrv.nl", "gravatar.com", "schema.org", "w3.org",
+         "sentry.io", "googletagmanager", "google-analytics", "cloudflareinsights")
+
+
+def discover(url: str, sesi: requests.Session, args):
+    """Lacak endpoint API dari sebuah halaman: HTML -> file JS -> URL/tabel API."""
+    print(f"\n=== DISCOVER: {url} ===")
+    r = sesi.get(url, headers={"User-Agent": args.user_agent}, timeout=args.timeout,
+                 verify=not args.insecure)
+    print(f"HTTP {r.status_code} | {r.headers.get('Content-Type','-')} | {len(r.text):,} byte")
+    if not (200 <= r.status_code < 300):
+        print("Gagal ambil halaman. Cek URL / butuh login / diblokir.")
+        return 1
+
+    teks = r.text
+    is_json = False
+    try:
+        json.loads(teks)
+        is_json = True
+    except Exception:
+        pass
+
+    if is_json:
+        print("\nHalaman ini langsung balas JSON — gak perlu discover.")
+        print(f"Langsung scrape:\n  python scrape.py {url} -o hasil.csv")
+        return 0
+
+    try:
+        from bs4 import BeautifulSoup
+        try:
+            soup = BeautifulSoup(teks, "lxml")
+        except Exception:
+            soup = BeautifulSoup(teks, "html.parser")
+    except ImportError:
+        soup = None
+
+    # --- sinyal SPA ---
+    n_a = len(soup.find_all("a", href=True)) if soup else 0
+    n_script = len(soup.find_all("script")) if soup else 0
+    root = soup.select_one("#root, #app, #__next, #__nuxt") if soup else None
+    teks_body = soup.get_text(" ", strip=True) if soup else ""
+    spa = bool(root) and n_a == 0 and len(teks_body) < 300
+
+    print(f"\n[struktur] <a>={n_a}  <script>={n_script}  teks terlihat={len(teks_body)} karakter")
+    if spa:
+        print("★ Ini SPA (React/Vue/Next) — HTML-nya kerangka kosong, data diambil dari API.")
+        print("  Scraping HTML gak akan dapat apa-apa. Harus nemu endpoint API-nya (di bawah).")
+    elif n_a >= 3:
+        print("→ Halaman HTML biasa, scraping langsung bisa jalan.")
+
+    # --- link di HTML ---
+    if soup and n_a:
+        print(f"\n[link di HTML] ({n_a} total, maks 25 ditampilkan)")
+        seen = set()
+        for a in soup.find_all("a", href=True):
+            u = urljoin(url, a["href"])
+            if u in seen or u.startswith(("javascript:", "#", "mailto:")):
+                continue
+            seen.add(u)
+            print(f"  {u[:95]:95s} | {a.get_text(' ', strip=True)[:35]}")
+            if len(seen) >= 25:
+                break
+
+    # --- kumpulkan file JS ---
+    js_files = []
+    for sc in (soup.find_all("script", src=True) if soup else []):
+        js_files.append(urljoin(url, sc["src"]))
+    for m in JS_URL_RE.findall(teks):
+        cand = urljoin(url, m if m.startswith("assets/") else m.lstrip("/"))
+        if cand not in js_files:
+            js_files.append(cand)
+    js_files = list(dict.fromkeys(js_files))[: args.max_js]
+
+    bundle = ""
+    if js_files:
+        print(f"\n[js] mengunduh {len(js_files)} file bundle...")
+        diunduh = set()
+
+        def ambil(daftar):
+            nonlocal bundle
+            for j in daftar:
+                if j in diunduh or len(diunduh) >= args.max_js:
+                    continue
+                diunduh.add(j)
+                try:
+                    jr = sesi.get(j, headers={"User-Agent": args.user_agent},
+                                  timeout=args.timeout, verify=not args.insecure)
+                    if jr.status_code == 200:
+                        bundle += jr.text + "\n"
+                except requests.RequestException:
+                    pass
+
+        ambil(js_files)
+        # pass 2: bundle SPA biasanya lazy-load chunk lain (mis. __vite__mapDeps)
+        ekstra = [urljoin(url, m if m.startswith("assets/") else m.lstrip("/"))
+                  for m in JS_URL_RE.findall(bundle)]
+        baru = [e for e in dict.fromkeys(ekstra) if e not in diunduh]
+        if baru:
+            print(f"[js] +{min(len(baru), args.max_js - len(diunduh))} chunk lazy-load...")
+            ambil(baru)
+        print(f"     terkumpul {len(bundle):,} byte JavaScript dari {len(diunduh)} file")
+
+    sumber = teks + "\n" + bundle
+    temuan = {}
+
+    def catat(kategori, nilai, catatan=""):
+        nilai = nilai.strip().rstrip("'\"`,);")
+        if not nilai or len(nilai) < 4:
+            return
+        if any(nz in nilai for nz in NOISE):
+            return
+        temuan.setdefault(kategori, {})
+        if nilai not in temuan[kategori]:
+            temuan[kategori][nilai] = catatan
+
+    for m in SUPA_URL_RE.findall(sumber):
+        catat("Supabase", f"https://{m}.supabase.co", "project")
+    for m in FIREBASE_RE.findall(sumber):
+        for x in m:
+            if x:
+                catat("Firebase", x, "project")
+    for m in ABS_URL_RE.findall(sumber):
+        if ".js" in m or ".css" in m or ".png" in m or ".jpg" in m or ".svg" in m or ".woff" in m:
+            continue
+        catat("URL eksternal", m)
+    for m in API_PATH_RE.findall(sumber):
+        catat("Path API", m)
+    for m in SUPA_TABLE_RE.findall(sumber):
+        catat("Tabel Supabase", m)
+    for m in RPC_RE.findall(sumber):
+        catat("Fungsi RPC", m)
+
+    if not temuan:
+        print("\nGak ketemu endpoint API di HTML/JS. Kemungkinan:")
+        print("  - URL API dibentuk dinamis (template string) -> butuh DevTools tab Network")
+        print("  - atau datanya memang server-rendered")
+        return 0
+
+    for kat in ("Supabase", "Firebase", "Path API", "URL eksternal", "Tabel Supabase", "Fungsi RPC"):
+        if kat not in temuan:
+            continue
+        print(f"\n[{kat}]")
+        for nilai, cat in list(temuan[kat].items())[:30]:
+            print(f"  {nilai[:100]}" + (f"   ({cat})" if cat else ""))
+
+    # --- saran perintah siap pakai ---
+    print("\n" + "=" * 62)
+    print("SARAN PERINTAH")
+    print("=" * 62)
+    if "Tabel Supabase" in temuan and "Supabase" in temuan:
+        base = next(iter(temuan["Supabase"]))
+        for tb in list(temuan["Tabel Supabase"])[:3]:
+            print(f"\n# Supabase/PostgREST — tabel '{tb}'")
+            print(f"python scrape.py -b {base}/rest/v1 -e /{tb} \\")
+            print(f"    -H 'apikey: ANON_KEY' -H 'Authorization: Bearer ANON_KEY' \\")
+            print(f"    --param select=* -o {tb}.csv")
+    if "Path API" in temuan:
+        pr = urlparse(url)
+        for pa in list(temuan["Path API"])[:3]:
+            print(f"\npython scrape.py -b {pr.scheme}://{pr.netloc} -e {pa} --inspect")
+    if "URL eksternal" in temuan:
+        for ue in list(temuan["URL eksternal"])[:3]:
+            print(f"\npython scrape.py {ue} --inspect")
+    print("\nTip: selalu akhiri dengan --inspect buat lihat struktur datanya sebelum scrape.")
+    return 0
+
 
 def inspect(resp: dict, args):
     print(f"\n=== INSPEKSI ===")
@@ -578,6 +871,8 @@ CONTOH
     p.add_argument("-c", "--config", help="file JSON berisi default argumen (CLI tetap menang)")
     p.add_argument("-n", "--dry-run", action="store_true",
                    help="cuma cetak URL yang bakal di-request, gak kirim apa-apa")
+    p.add_argument("target", nargs="*",
+                   help="URL / endpoint langsung, tanpa perlu -b/-e. Contoh: python scrape.py https://situs.com")
     p.add_argument("-b", "--base-url", help="contoh: https://api.contoh.com")
     p.add_argument("-e", "--endpoint", action="append", default=[],
                    help="path/endpoint; boleh dipakai berulang. Boleh URL absolut.")
@@ -632,6 +927,10 @@ CONTOH
     g4.add_argument("--insecure", "-k", action="store_true", help="abaikan error sertifikat SSL")
     g4.add_argument("--no-redirect", action="store_true")
     g4.add_argument("--allow-status", action="store_true", help="tetap proses walau HTTP != 2xx")
+    g4.add_argument("--discover", action="store_true",
+                    help="lacak endpoint API otomatis: scan HTML + semua file JS, "
+                         "cari URL API, tabel Supabase/Firebase, path /api/, graphql")
+    g4.add_argument("--max-js", type=int, default=25, help="--discover: maks file JS yang diunduh (default 25)")
     g4.add_argument("-i", "--inspect", action="store_true",
                     help="mode inspeksi: tampilkan struktur respons + saran --items/--field, lalu keluar")
     g4.add_argument("-v", "--verbose", action="store_true")
@@ -675,8 +974,27 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(load_config(argv))
     ARGS = args
 
+    # positional target: python scrape.py https://situs.com  ==> base + endpoint otomatis
+    for t in args.target:
+        t = t.strip()
+        if not t:
+            continue
+        if t.startswith("http://") or t.startswith("https://"):
+            if not args.base_url:
+                pr = urlparse(t)
+                args.base_url = f"{pr.scheme}://{pr.netloc}"
+                ep = pr.path or "/"
+                if pr.query:
+                    ep += "?" + pr.query
+                args.endpoint.append(ep)
+            else:
+                args.endpoint.append(t)      # sudah ada base -> anggap endpoint/URL lengkap
+        else:
+            args.endpoint.append(t)
+
     if not args.endpoint:
-        sys.exit("Wajib minimal satu --endpoint. Contoh: -e /api/v1/items   (lihat --help)")
+        sys.exit("Butuh target. Contoh:  python scrape.py https://situs.com\n"
+                 "          atau:  python scrape.py -b https://api.situs.com -e /v1/items")
     if args.inspect and not args.base_url:
         sys.exit("--inspect butuh --base-url")
 
@@ -706,6 +1024,13 @@ def main(argv=None) -> int:
             args.format = "raw"
 
     sesi = build_session(args)
+
+    # --- discover: lacak endpoint API ---
+    if args.discover:
+        target = args.endpoint[0]
+        full = join_url(args.base_url, target)
+        sesi_d = build_session(args)
+        return discover(full, sesi_d, args)
 
     # --- dry-run: cetak rencana request, jangan kirim apa-apa ---
     if args.dry_run:
@@ -799,6 +1124,13 @@ def main(argv=None) -> int:
                     records.append(payload)          # respons mentah apa adanya
                     got = 1
                 else:
+                    if not args.items and not args.field:
+                        ap_, n_ = auto_items_path(payload)
+                        if ap_:
+                            args.items = ap_
+                            log(f"  auto: pakai --items '{ap_}' ({n_} objek)")
+                        else:
+                            log("  auto: gak ada list di respons -> diratakan apa adanya")
                     got_rows = extract_json(payload, args)
                     for row in got_rows:
                         if args.meta:
@@ -819,6 +1151,26 @@ def main(argv=None) -> int:
                     records.append(resp["text"])
                     got = 1
                 else:
+                    if not args.item and not args.field:
+                        sel, n_ = auto_item_selector(soup)
+                        if not sel and soup.select("a[href]"):
+                            sel, n_ = "a[href]", len(soup.select("a[href]"))
+                            args.field = ["teks=@text", "link=@href"]
+                            log(f"  auto: gak ada elemen berulang -> ambil {n_} link halaman")
+                        elif sel:
+                            args.item = sel
+                            fs = auto_html_fields(soup, sel)
+                            args.field = [f"{f.name}={f.loc}@{f.attr}" for f in fs]
+                            log(f"  auto: pakai --item '{sel}' ({n_} elemen), {len(fs)} kolom: "
+                                + ", ".join(f.name for f in fs))
+                        else:
+                            log("  auto: halaman ini kosong / di-render JavaScript. "
+                                "Coba:  --discover")
+                    if not args.field:
+                        log("  gak ada yang bisa diekstrak dari HTML ini.\n"
+                            "    -> jalankan dengan --discover buat nyari endpoint API-nya,\n"
+                            "    -> atau tentukan manual: --item 'div.kartu' -f 'judul=h3@text'")
+                        break
                     got_rows = extract_html(soup, resp["url"], args)
                     for row in got_rows:
                         if args.meta:
