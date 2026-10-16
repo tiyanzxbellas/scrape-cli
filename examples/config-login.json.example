@@ -1,0 +1,23 @@
+{
+  "_PENTING": "Ini TEMPLATE. Copy jadi config-login.json (sudah masuk .gitignore), isi datanya, JANGAN commit file yang sudah berisi kredensial asli.",
+  "_cara_pakai": "cp examples/config-login.json.example config-login.json && nano config-login.json",
+
+  "base_url": "https://situs-target.com",
+  "endpoint": ["/api/data-saya"],
+
+  "login_endpoint": "/login",
+  "login_data": ["username=GANTI_USER", "password=GANTI_PASSWORD"],
+  "cookies": "sesi.json",
+  "save_cookies": true,
+
+  "header": ["User-Agent: BotNama/1.0 (+https://situsmu.com; email@kamu.com)"],
+
+  "items": "data",
+  "field": ["id=id", "nama=name"],
+  "pages": 2,
+  "next_param": "page",
+  "delay": 2.0,
+  "jitter": 1.0,
+  "out": "data-saya.csv",
+  "format": "csv"
+}

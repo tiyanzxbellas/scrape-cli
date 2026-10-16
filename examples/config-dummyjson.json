@@ -1,0 +1,12 @@
+{
+  "_komentar": "Contoh: JSON API dengan pagination pakai nomor halaman. Jalankan: python scrape.py -c examples/config-dummyjson.json --dry-run",
+  "base_url": "https://dummyjson.com",
+  "endpoint": ["/products", "/products/category/beauty"],
+  "items": "products",
+  "field": ["id=id", "nama=title", "harga=price", "kategori=category", "stok=stock"],
+  "pages": 2,
+  "next_param": "page",
+  "delay": 0.4,
+  "out": "hasil.csv",
+  "format": "csv"
+}

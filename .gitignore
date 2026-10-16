@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Hasil scrape — jangan pernah commit data hasil scraping
+*.csv
+*.ndjson
+hasil*.json
+out*.json
+*.sqlite
+*.db
+
+# Cookie / sesi / kredensial — PENTING, jangan pernah ke-commit
+cookies*.json
+sesi*.json
+session*.json
+*.token
+.env
+.env.*
+!.env.example
+auth.json
+config.local.json
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

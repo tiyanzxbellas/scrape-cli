@@ -1,0 +1,12 @@
+{
+  "_komentar": "Contoh: pagination pakai URL 'next' dari respons (offset/cursor). Tes: python scrape.py -c examples/config-pokeapi.json --dry-run",
+  "base_url": "https://pokeapi.co/api/v2",
+  "endpoint": ["/pokemon"],
+  "items": "results",
+  "field": ["nama=name", "url_detail=url"],
+  "next": "next",
+  "pages": 5,
+  "delay": 0.3,
+  "out": "pokemon.csv",
+  "format": "csv"
+}

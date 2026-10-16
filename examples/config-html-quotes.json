@@ -1,0 +1,19 @@
+{
+  "_komentar": "Contoh: target HTML + pagination lewat tombol next. Tes: python scrape.py -c examples/config-html-quotes.json --dry-run",
+  "base_url": "https://quotes.toscrape.com",
+  "endpoint": ["/"],
+  "as": "html",
+  "item": "div.quote",
+  "field": [
+    "kutipan=span.text@text",
+    "penulis=small.author@text",
+    "tags=div.tags a.tag@text",
+    "link_detail=a[href]@href"
+  ],
+  "sep": ", ",
+  "next": "li.next a",
+  "pages": 3,
+  "delay": 1.0,
+  "out": "kutipan.csv",
+  "format": "csv"
+}
