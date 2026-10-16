@@ -43,10 +43,43 @@ $ python scrape https://nefusoft2.tiyan.my.id
 2. **JSON?** → cari list-of-dict terbesar → jadiin baris CSV
 3. **HTML ada isinya?** → cari elemen berulang pakai heuristik keseragaman → bikin kolom dari anaknya
 4. **HTML kerangka kosong (SPA)?** → unduh semua bundle JS (termasuk chunk lazy-load) →
-   grep endpoint API → **uji tiap kandidat** → pakai yang datanya paling banyak → simpan CSV
+   grep endpoint API → **uji tiap kandidat** → pakai yang datanya paling banyak
+   (atau `--all` untuk semuanya) → ikuti pagination sampai habis → simpan CSV
 5. Gagal semua? → suruh jalankan `--discover` buat lihat detail
 
 Nama file output dibuat otomatis dari domain + path. Mau tentukan sendiri: `-o nama.csv`.
+
+### Ambil SEMUA, sampai akar
+
+Default-nya dia ambil satu endpoint yang datanya paling banyak, dan **mengikuti pagination
+sampai habis** (maks 10 halaman). Mau lebih dari itu:
+
+```bash
+python scrape https://situs.com --all        # SEMUA endpoint, tiap satu jadi file CSV sendiri
+python scrape https://situs.com --max-pages 50   # ikuti pagination sampai 50 halaman
+python scrape https://situs.com --dalam 2    # crawl link internal sampai kedalaman 2
+```
+
+Contoh nyata, `--all` di sebuah SPA:
+```
+  → 12 kandidat endpoint, diuji satu-satu:
+    ✓   22 record  /api/v1/schedule
+    ✓  116 record  /api/v1/ongoing
+    ✓  600 record  /api/v1/popular      ← pagination diikuti
+    ✓   33 record  /api/v1/genre
+  ★ --all: 4 endpoint dipakai semua
+
+============================================================
+✔    22 record × 17 kolom  →  ..._v1_schedule.csv
+✔   116 record × 17 kolom  →  ..._v1_ongoing.csv
+✔   600 record × 16 kolom  →  ..._v1_popular.csv
+✔    33 record ×  4 kolom  →  ..._v1_genre.csv
+============================================================
+  total 771 record dari 4 sumber
+```
+
+Dan `--dalam 1` di situs HTML biasa: 20 halaman dikunjungi, 260 record, satu CSV
+dengan kolom `_url` dan `_depth` supaya ketahuan tiap baris berasal dari halaman mana.
 
 > `scrape` (tanpa `.py`) adalah launcher ke `scrape.py`. Dua-duanya sama.
 > Mau lebih pendek lagi? Di Termux:
@@ -317,6 +350,10 @@ Nama key = nama flag dengan `_` (mis. `--next-param` → `next_param`).
 
 | Flag | Fungsi |
 |---|---|
+| `--all` | mode otomatis: scrape SEMUA endpoint yang hidup, bukan cuma yang terbaik |
+| `--max-pages N` | mode otomatis: ikuti pagination tiap endpoint, maks N halaman (default 10) |
+| `--dalam N` | crawl link internal sampai kedalaman N (default 0) |
+| `--coba N` | jumlah kandidat endpoint yang diuji saat mode otomatis (default 12) |
 | `--limit N` | berhenti setelah N record (buat sampling/cek cepat) |
 | `--delay 2 --jitter 1` | jeda 2–3 detik antar request. **Jangan di-set 0** di situs orang. |
 | `--retry 3` | retry otomatis untuk 429/5xx/error jaringan (backoff eksponensial + hormati `Retry-After`) |

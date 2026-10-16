@@ -294,13 +294,14 @@ def auto_items_path(payload):
 
 def auto_item_selector(soup):
     """
-    HTML: tebak selector item berulang (kartu/baris tabel).
+    Tebak selector item berulang (kartu / baris tabel) dari sebuah halaman.
 
-    Prinsipnya: item asli itu SERAGAM satu sama lain (jumlah anak & panjang teks mirip),
-    sedangkan elemen pembungkus (div.container, div.row) isinya campur aduk dan gede.
+    Sinyal yang dipakai, hasil pengukuran di halaman nyata:
+      jumlah      -> item biasanya banyak (n ** 0.8, bukan linear biar wrapper gak menang)
+      isi teks    -> item punya teks; elemen dekoratif (ikon, spacer) disingkirkan
+      jumlah anak -> kartu punya beberapa anak; tapi >60 = pembungkus halaman
+      keseragaman -> item asli mirip satu sama lain (CV panjang teks <= 0.4)
     """
-    import math
-
     groups = {}
     for el in soup.find_all(True):
         if el.name in SKIP_TAG:
@@ -312,38 +313,41 @@ def auto_item_selector(soup):
         groups.setdefault(key, []).append(el)
 
     def nilai_untuk(min_count):
-        kandidat = []
+        out = []
         for key, el_list in groups.items():
             if len(el_list) < min_count:
                 continue
             sampel = el_list[:12]
             n = len(sampel)
             teks = [len(e.get_text(" ", strip=True)) for e in sampel]
-            dalam = [len(e.find_all(True)) for e in sampel]
+            anak = [len(e.find_all(True)) for e in sampel]
             t_avg = sum(teks) / n
-            d_avg = sum(dalam) / n
+            a_avg = sum(anak) / n
 
-            # keseragaman: item dalam list mirip satu sama lain
-            if n >= 3 and d_avg > 0:
-                var = sum((x - d_avg) ** 2 for x in dalam) / n
-                rasio = math.sqrt(var) / d_avg
-                seragam = 1.0 if rasio <= 0.6 else max(0.15, 0.6 / rasio)
+            # elemen tanpa isi apa pun (ikon, garis, spacer) -> buang
+            if t_avg <= 0:
+                if not (sampel[0].name in ("a", "img") or sampel[0].find(["a", "img"])):
+                    continue
+
+            # keseragaman panjang teks antar item
+            if n >= 3 and t_avg > 0:
+                var = sum((x - t_avg) ** 2 for x in teks) / n
+                cv = (var ** 0.5) / t_avg
+                seragam = 1.0 if cv <= 0.4 else max(0.15, 0.4 / cv)
             else:
                 seragam = 0.7
 
-            kaya = (1 + min(t_avg, 400) / 80) * (1 + min(d_avg, 30) / 6)
-            # elemen pembungkus biasanya punya >60 keturunan -> dihukum
-            if d_avg > 60:
-                kaya *= 60 / d_avg
-            punya_link = sum(1 for e in sampel if e.find("a") or e.name == "a") / n
-            skor = math.log(len(el_list) + 1) * kaya * seragam * (1 + punya_link)
-            kandidat.append((skor, key, len(el_list)))
-        return kandidat
+            kaya = (1 + min(t_avg, 300) / 60) * (1 + min(a_avg, 20) / 5)
+            if a_avg > 60:                       # pembungkus sekelas halaman
+                kaya *= 60 / a_avg
+
+            out.append(((len(el_list) ** 0.8) * kaya * seragam, key, len(el_list)))
+        return out
 
     for ambang in (3, 2):
         skor = nilai_untuk(ambang)
         if skor:
-            skor.sort(reverse=True)
+            skor.sort(key=lambda x: -x[0])
             return skor[0][1], skor[0][2]
     return None, 0
 
@@ -702,6 +706,56 @@ def uji_kandidat(u: str, sesi: requests.Session, args):
             "text": r.text, "status": r.status_code}
 
 
+NEXT_KEYS = ("next", "next_page", "nextPage", "pagination.next", "meta.next",
+             "links.next", "data.next", "paging.next", "next_url", "nextUrl")
+
+
+def ikuti_paginasi(u, sesi, args, items_path, halaman_pertama, payload_pertama):
+    """Kumpulkan semua halaman dari satu endpoint. Balikin (semua_items, url_terakhir)."""
+    semua = list(halaman_pertama)
+    cur = u
+    for hal in range(1, max(1, args.max_pages)):
+        nxt = None
+        for k in NEXT_KEYS:
+            v = get_path(payload_pertama if hal == 1 else payload, k)
+            if isinstance(v, str) and v.strip():
+                nxt = urljoin(cur, v)
+                break
+        if not nxt:
+            pr = urlparse(cur)
+            q = dict(parse_qsl(pr.query))
+            kunci = next((k for k in ("page", "p", "halaman", "pageNum", "offset") if k in q), "page")
+            if kunci == "offset":
+                q["offset"] = str(int(q.get("offset", 0) or 0) + len(halaman_pertama))
+            else:
+                q[kunci] = str(int(q.get(kunci, 1) or 1) + 1)
+            nxt = urlunparse(pr._replace(query=urlencode(q)))
+        if not nxt or nxt == cur:
+            break
+        try:
+            r = sesi.get(nxt, headers={"User-Agent": args.user_agent},
+                         timeout=args.timeout, verify=not args.insecure)
+        except requests.RequestException:
+            break
+        if r.status_code != 200:
+            break
+        try:
+            payload = json.loads(r.text)
+        except Exception:
+            break
+        baru = get_path(payload, items_path) if items_path else payload
+        if not isinstance(baru, list) or not baru:
+            break
+        if baru == halaman_pertama:            # mentok, isinya diulang
+            break
+        semua += baru
+        cur = nxt
+        time.sleep(0.2)
+    else:
+        return semua, cur
+    return semua, cur
+
+
 def kandidat_api(info: dict, url_halaman: str) -> list:
     """Susun daftar URL API yang layak dicoba dari hasil analisis."""
     asal = urlparse(url_halaman)
@@ -741,6 +795,72 @@ def nama_file_otomatis(url: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", nama)[:70] + ".csv"
 
 
+def crawl_dalam(url_awal: str, sesi: requests.Session, args):
+    """Telusuri link internal sampai kedalaman --dalam, ekstrak tiap halaman."""
+    asal = urlparse(url_awal).netloc
+    antre = [(url_awal, 0)]
+    dilihat = set()
+    semua = []
+    batas = 50
+    print(f"→ crawl sampai kedalaman {args.dalam} dari {url_awal}")
+    while antre and len(dilihat) < batas:
+        u, dalam = antre.pop(0)
+        u = u.split("#")[0]
+        if u in dilihat:
+            continue
+        dilihat.add(u)
+        try:
+            r = sesi.get(u, headers={"User-Agent": args.user_agent},
+                         timeout=args.timeout, verify=not args.insecure)
+        except requests.RequestException as e:
+            print(f"  · {u[:70]} -> gagal ({e})")
+            continue
+        if r.status_code != 200:
+            print(f"  · {u[:70]} -> HTTP {r.status_code}")
+            continue
+        r.encoding = args.encoding or r.apparent_encoding or "utf-8"
+        print(f"  [{dalam}] {u[:74]}")
+
+        rows = []
+        try:
+            payload = json.loads(r.text)
+            ap_, _ = auto_items_path(payload)
+            items = get_path(payload, ap_) if ap_ else payload
+            if not isinstance(items, list):
+                items = [items]
+            rows = [flatten(x) if isinstance(x, (dict, list)) else {"value": x} for x in items]
+        except Exception:
+            try:
+                from bs4 import BeautifulSoup
+                try:
+                    soup = BeautifulSoup(r.text, "lxml")
+                except Exception:
+                    soup = BeautifulSoup(r.text, "html.parser")
+                sel, _ = auto_item_selector(soup)
+                if sel:
+                    fs = auto_html_fields(soup, sel)
+                    args.item, args.field = sel, [f"{f.name}={f.loc}@{f.attr}" for f in fs]
+                    rows = extract_html(soup, r.url, args)
+                    args.item, args.field = None, []
+                # kumpulkan link internal
+                if dalam < args.dalam:
+                    for a in soup.find_all("a", href=True):
+                        nxt = urljoin(r.url, a["href"]).split("#")[0]
+                        if urlparse(nxt).netloc == asal and nxt not in dilihat \
+                                and not re.search(r"\.(jpg|jpeg|png|gif|svg|css|js|pdf|zip)$", nxt, re.I):
+                            antre.append((nxt, dalam + 1))
+            except ImportError:
+                pass
+
+        rows = [x for x in rows if any(str(v).strip() for v in x.values())]
+        for row in rows:
+            row["_url"], row["_depth"] = r.url, dalam
+        print(f"      +{len(rows)} record")
+        semua += rows
+        time.sleep(args.delay)
+    return semua
+
+
 def pipeline_otomatis(url: str, sesi: requests.Session, args):
     """
     Ambil URL, putuskan sendiri cara scrape-nya:
@@ -767,10 +887,17 @@ def pipeline_otomatis(url: str, sesi: requests.Session, args):
     try:
         payload = json.loads(r.text)
         ap_, n_ = auto_items_path(payload)
+        items = get_path(payload, ap_) if ap_ else payload
+        if not isinstance(items, list):
+            items = [items]
+        if args.max_pages > 1:
+            items, akhir = ikuti_paginasi(r.url, sesi, args, ap_, items, payload)
+            if akhir != r.url:
+                print(f"  → pagination diikuti sampai {akhir[:70]}")
         args.items = ap_
-        rows = extract_json(payload, args)
-        print(f"  ✓ JSON — pakai items '{ap_ or '(root)'}' → {len(rows)} record")
-        return rows, {"url": r.url, "items": ap_}
+        rows = [flatten(x) if isinstance(x, (dict, list)) else {"value": x} for x in items]
+        print(f"  ✓ JSON — items '{ap_ or '(root)'}' → {len(rows)} record")
+        return rows, {"url": r.url, "items": ap_, "label": nama_file_otomatis(r.url)}
     except Exception:
         pass
 
@@ -807,27 +934,48 @@ def pipeline_otomatis(url: str, sesi: requests.Session, args):
         return [], info
 
     print(f"  → {len(daftar[:args.coba])} kandidat endpoint, diuji satu-satu:")
-    terbaik = None
+    hidup = []
     for u in daftar[: args.coba]:
         hasil = uji_kandidat(u, sesi, args)
         if hasil:
-            print(f"    ✓ {hasil['n']:>4} record  {u[:78]}")
-            if terbaik is None or hasil["n"] > terbaik["n"]:
-                terbaik = hasil
+            # ikuti pagination kalau diminta
+            if args.max_pages > 1:
+                items, akhir = ikuti_paginasi(u, sesi, args, hasil["items"],
+                                              get_path(hasil["payload"], hasil["items"]),
+                                              hasil["payload"])
+                hasil["n"] = len(items)
+                hasil["_items"] = items
+                hasil["_pag"] = (akhir != u)
+            print(f"    ✓ {hasil['n']:>4} record  {u[:78]}"
+                  + ("   ← pagination diikuti" if hasil.get("_pag") else ""))
+            hidup.append(hasil)
         else:
             print(f"    · lewat        {u[:78]}")
         time.sleep(0.2)
 
-    if not terbaik:
+    if not hidup:
         print("  ✗ gak ada endpoint yang balikin data list.")
         return [], info
 
-    print(f"  ★ pilih: {terbaik['url']}")
-    args.items = terbaik["items"]
-    args.field = []
-    rows = extract_json(terbaik["payload"], args)
-    print(f"  ✓ {len(rows)} record (items '{terbaik['items']}')")
-    return rows, {"url": terbaik["url"], "items": terbaik["items"]}
+    if not args.all:
+        hidup.sort(key=lambda x: -x["n"])
+        print(f"  ★ paling banyak: {hidup[0]['url']}")
+        print(f"    (mau SEMUA endpoint? tambah  --all )")
+        t = hidup[0]
+        items = t.get("_items") or get_path(t["payload"], t["items"])
+        rows = [flatten(x) if isinstance(x, (dict, list)) else {"value": x} for x in items]
+        return rows, {"url": t["url"], "items": t["items"], "label": nama_file_otomatis(t["url"])}
+
+    # --all: kembalikan semuanya, main() yang pisah-pisahin file
+    print(f"  ★ --all: {len(hidup)} endpoint dipakai semua")
+    gabungan = []
+    for t in hidup:
+        items = t.get("_items") or get_path(t["payload"], t["items"])
+        rows = [flatten(x) if isinstance(x, (dict, list)) else {"value": x} for x in items]
+        for row in rows:
+            row["_endpoint"] = t["url"]
+        gabungan.append((nama_file_otomatis(t["url"]), rows, t["url"]))
+    return gabungan, info
 
 
 def inspect(resp: dict, args):
@@ -1096,6 +1244,13 @@ CONTOH
     g4.add_argument("--discover", action="store_true",
                     help="lacak endpoint API otomatis: scan HTML + semua file JS, "
                          "cari URL API, tabel Supabase/Firebase, path /api/, graphql")
+    g4.add_argument("--all", action="store_true",
+                    help="mode otomatis: scrape SEMUA endpoint yang ada datanya, "
+                         "masing-masing jadi file CSV sendiri (bukan cuma yang terbaik)")
+    g4.add_argument("--max-pages", type=int, default=10,
+                    help="mode otomatis: ikuti pagination tiap endpoint sampai habis, maks N halaman (default 10)")
+    g4.add_argument("--dalam", type=int, default=0,
+                    help="crawl link internal sampai kedalaman N (default 0 = halaman itu saja)")
     g4.add_argument("--coba", type=int, default=12,
                     help="mode otomatis: jumlah kandidat endpoint yang diuji (default 12)")
     g4.add_argument("--max-js", type=int, default=25, help="--discover: maks file JS yang diunduh (default 25)")
@@ -1222,41 +1377,68 @@ def main(argv=None) -> int:
             if fetch(lurl, sesi_a, args, method="POST", data=args.login_data,
                      json_body=args.login_json_parsed, percobaan=2) is None:
                 log("login gagal — lanjut tanpa sesi.")
-        semua = []
-        sumber = None
+        def tulis_csv(nama, rows):
+            kolom = []
+            for row in rows:
+                for k in row:
+                    if k not in kolom:
+                        kolom.append(k)
+            with open(nama, "w", encoding="utf-8", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=kolom, extrasaction="ignore")
+                w.writeheader()
+                w.writerows(rows)
+            return len(kolom)
+
+        berkas = []          # [(nama_file, jumlah_record, jumlah_kolom, sumber)]
+
         for ep in args.endpoint:
             full = join_url(args.base_url, ep)
-            rows, info = pipeline_otomatis(full, sesi_a, args)
-            if rows:
-                for row in rows:
-                    if args.meta and info:
-                        row["_url"] = info.get("url", full)
-                semua += rows
-                sumber = info or sumber
-            args.items, args.field, args.item = "", [], None   # reset antar target
+
+            # --- crawl link internal ---
+            if args.dalam > 0:
+                rows = crawl_dalam(full, sesi_a, args)
+                if rows:
+                    nama = args.out if args.out != "-" else nama_file_otomatis(full).replace(".csv", "_crawl.csv")
+                    n = tulis_csv(nama, rows)
+                    berkas.append((nama, len(rows), n, full))
+                continue
+
+            hasil, info = pipeline_otomatis(full, sesi_a, args)
+            args.items, args.field, args.item = "", [], None
+
+            if not hasil:
+                continue
+
+            # --all: hasil berupa list (nama, rows, url)
+            if isinstance(hasil, list) and hasil and isinstance(hasil[0], tuple):
+                for nama, rows, src in hasil:
+                    if not rows:
+                        continue
+                    tujuan = nama if args.out == "-" else f"{args.out}-{nama}"
+                    n = tulis_csv(tujuan, rows)
+                    berkas.append((tujuan, len(rows), n, src))
+            else:
+                rows = hasil
+                src = (info or {}).get("url", full)
+                tujuan = args.out if args.out != "-" else (info or {}).get("label") or nama_file_otomatis(src)
+                n = tulis_csv(tujuan, rows)
+                berkas.append((tujuan, len(rows), n, src))
+
         if args.save_cookies and args.cookies:
             save_cookies(sesi_a, args.cookies)
-        if not semua:
+        if not berkas:
             print("\n✗ Gak dapat data. Coba jalankan dengan --discover buat lihat detailnya.",
                   file=sys.stderr)
             return 1
-        # nama file otomatis kalau user gak minta -o
-        tujuan = args.out
-        if tujuan == "-":
-            tujuan = nama_file_otomatis((sumber or {}).get("url", join_url(args.base_url, args.endpoint[0])))
-        kolom = []
-        for row in semua:
-            for k in row:
-                if k not in kolom:
-                    kolom.append(k)
-        with open(tujuan, "w", encoding="utf-8", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=kolom, extrasaction="ignore")
-            w.writeheader()
-            w.writerows(semua)
-        print(f"\n✔ {len(semua)} record × {len(kolom)} kolom  →  {tujuan}")
-        if sumber and sumber.get("url"):
-            print(f"  sumber data : {sumber['url']}")
-        print(f"  mau atur manual? tambahkan --items/--field, atau lihat struktur: --inspect")
+
+        total = sum(b[1] for b in berkas)
+        print(f"\n{'=' * 60}")
+        for nama, jr, nk, src in berkas:
+            print(f"✔ {jr:>5} record × {nk:>2} kolom  →  {nama}")
+        print(f"{'=' * 60}")
+        print(f"  total {total} record dari {len(berkas)} sumber")
+        if len(berkas) == 1:
+            print(f"  sumber: {berkas[0][3]}")
         return 0
 
     # --- discover: lacak endpoint API ---
